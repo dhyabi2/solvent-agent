@@ -1,28 +1,49 @@
 """
 nano_rail.py — SOLVENT's optional feeless spend rail (Nano / XNO).
 
-Alongside Stripe Issuing, SOLVENT can settle a vendor bill on Nano (XNO) — the
-only rail where a payment settles feeless with single-block finality, so a
-small provisioning bill arrives whole with no processing-floor eating it.
+Alongside Stripe Issuing, SOLVENT can settle a vendor bill on Nano (XNO), a
+rail where a payment settles feeless with single-block finality, so a small
+provisioning bill arrives whole with no processing floor eating it.
 
-This is a *spend-only* client: it models paying a Nano-capable vendor endpoint
-via the exact x402 handshake. Like StripeClient, it is offline-first — with no
-NANO_* configuration it runs the same deterministic simulator the rest of the
-demo uses, so the full business loop still closes in a demo.
+Opt-in only. The rail is used for vendor spend only when SOLVENT_NANO_RAIL is
+set to 1/true/yes; otherwise `spend_rail()` returns the Stripe client and this
+module is never exercised.
+
+This is a *spend-only*, simulate-only client for now. It models paying a
+Nano-capable vendor endpoint via the exact x402 handshake. With no
+NANO_WALLET_ADDRESS it runs a deterministic simulator, like StripeClient does
+without a key. With a wallet configured it fails closed: `pay_vendor` raises
+NotImplementedError, because signing, publishing and confirming a real block
+is not implemented and a derived id must never be reported as a real payment.
+
+Configuration (all optional, nothing has a network default):
+  SOLVENT_NANO_RAIL      1/true/yes to route vendor spend through this rail
+  NANO_FACILITATOR_URL   base URL of an x402 facilitator; `/supported` is read
+  NANO_WALLET_ADDRESS    presence switches the rail to live mode (which raises)
+  NANO_XNO_PRICE_CENTS   fixed XNO price in USD cents (default 1000 = $10.00)
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
+import urllib.request
 import uuid
 from typing import Any
 
-SUPPORTED_FACILITATOR = "https://facilitator.pursekeeper.dev/supported"
 NANO_SCHEME = "exact"
 NANO_NETWORK = "nano:mainnet"
 EXACT_DEFAULT_WORK_THRESHOLD = "fffffff800000000"
+
+# 1 XNO == 10**30 raw. All amounts are computed in integer raw.
+RAW_PER_XNO = 10**30
+# The simulator's fixed XNO price in USD cents. This is not a price oracle:
+# override it with NANO_XNO_PRICE_CENTS; a live rail would need a real feed.
+DEMO_XNO_PRICE_CENTS = 1000
+
+FACILITATOR_TIMEOUT_S = 5.0
 
 # The x402 payment status codes SOLVENT understands, matching the project's
 # vendored x402 vocabulary: a 402 lists the rail; 400 / 410 say the quote or
@@ -30,22 +51,43 @@ EXACT_DEFAULT_WORK_THRESHOLD = "fffffff800000000"
 STATUS_PAYMENT_REQUIRED = 402
 STATUS_PAYMENT_ACCEPTED = 200
 
+_TRUTHY = ("1", "true", "yes")
 
-def _nanoraw(cents: int) -> int:
-    """Convert USD cents to Nano raw (XNO has 30 decimals, ~$0.70-ish long-run).
 
-    This is a *demo* conversion: it prices 1 XNO at 1000 USD cents for the
-    simulator so a tiny bill is a tiny, still-fractional raw amount. A live
-    rail would read the current price; the demo's job is to show the spend
-    path, not to be a price oracle.
+def nano_rail_enabled() -> bool:
+    """True only when SOLVENT_NANO_RAIL is explicitly set to 1/true/yes."""
+    return os.environ.get("SOLVENT_NANO_RAIL", "").strip().lower() in _TRUTHY
+
+
+def spend_rail(stripe: Any) -> Any:
+    """The client vendor spend goes through: NanoRail if opted in, else Stripe."""
+    return NanoRail() if nano_rail_enabled() else stripe
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _nanoraw(cents: int, price_cents: int) -> int:
+    """Convert USD cents to Nano raw at `price_cents` USD cents per XNO.
+
+    Pure integer math (1 XNO == 10**30 raw). A remainder rounds up, so the
+    vendor is never paid less than the bill.
     """
-    if cents < 0:
-        raise ValueError("amount must be non-negative")
-    return cents * (10**30) * (10**-3)  # 1 XNO == 1000 cents == 10^-3 XNO per cent
+    if not _is_int(cents) or cents < 0:
+        raise ValueError("amount must be a non-negative int")
+    if not _is_int(price_cents) or price_cents <= 0:
+        raise ValueError("price_cents must be a positive int")
+    return -(-cents * RAW_PER_XNO // price_cents)
 
 
-def _demonano(cents: int) -> str:
-    return str(_nanoraw(cents))
+def _price_from_env() -> int:
+    value = os.environ.get("NANO_XNO_PRICE_CENTS", "").strip()
+    if not value:
+        return DEMO_XNO_PRICE_CENTS
+    if not value.isdigit() or int(value) <= 0:
+        raise ValueError("NANO_XNO_PRICE_CENTS must be a positive integer (USD cents)")
+    return int(value)
 
 
 class NanoRail:
@@ -53,37 +95,47 @@ class NanoRail:
 
     Uses the same contract shape as StripeClient.pay_vendor: returns a dict
     that mirrors the treasury spend fields (`vendor`, `amount_cents`, `memo`,
-    `simulated`, `ts`). In simulate mode it returns a deterministic
-    single-block send record instead of a real confirmation.
+    `simulated`, `ts`). Only simulate mode returns; live mode raises.
     """
 
     def __init__(self) -> None:
-        self.facilitator = os.environ.get("NANO_FACILITATOR", SUPPORTED_FACILITATOR)
-        self.wallet_address = (
-            os.environ.get("NANO_WALLET_ADDRESS", "").strip()
-        )
+        facilitator = os.environ.get("NANO_FACILITATOR_URL", "").strip().rstrip("/")
+        self.facilitator: str | None = facilitator or None
+        self.wallet_address = os.environ.get("NANO_WALLET_ADDRESS", "").strip()
         self.live = bool(self.wallet_address)
+        self.price_cents = _price_from_env()
+
+    def _fetch_json(self, url: str) -> Any:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=FACILITATOR_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
     def supported(self) -> bool:
-        """Whether the configured facilitator advertises Nano mainnet.
+        """Whether the configured facilitator's /supported lists exact on Nano mainnet.
 
-        Kept dependency-free and honest: without a live fetch we check the
-        configured facilitator string, and a live wallet is required to be
-        considered 'live' (identical to how StripeClient needs a test key to
-        leave simulate mode).
+        Reads the x402 `/supported` response (`{"kinds": [{"scheme", "network"},
+        ...]}`). No configured facilitator, an unreachable one, or a malformed
+        response all mean False.
         """
-        if not self.live:
+        if not self.facilitator:
             return False
-        return NANO_NETWORK in self.facilitator  # honest static check for the demo
+        try:
+            data = self._fetch_json(f"{self.facilitator}/supported")
+        except Exception:
+            return False
+        kinds = data.get("kinds") if isinstance(data, dict) else None
+        if not isinstance(kinds, list):
+            return False
+        return any(
+            isinstance(kind, dict)
+            and kind.get("scheme") == NANO_SCHEME
+            and kind.get("network") == NANO_NETWORK
+            for kind in kinds
+        )
 
     def quote_endpoint(self, vendor: str, amount_cents: int) -> dict[str, Any]:
-        """Step 1 of the exact x402 handshake: request the seller's quote.
-
-        Returns the payment-required payload a vendor would serve (402). The
-        network string is the Nano mainnet scheme the swarm's facilitated x402
-        ecosystem advertises; `scheme`/`network` are what a buyer signs into.
-        """
-        if not isinstance(amount_cents, int) or amount_cents <= 0:
+        """Step 1 of the exact x402 handshake: the seller's payment-required quote."""
+        if not _is_int(amount_cents) or amount_cents <= 0:
             raise ValueError("amount_cents must be a positive int")
         return {
             "status": STATUS_PAYMENT_REQUIRED,
@@ -92,7 +144,7 @@ class NanoRail:
                 "scheme": NANO_SCHEME,
                 "network": NANO_NETWORK,
                 "asset": "XNO",
-                "amount": _demonano(amount_cents),
+                "amount": str(_nanoraw(amount_cents, self.price_cents)),
                 "work": "required",
                 "workThreshold": EXACT_DEFAULT_WORK_THRESHOLD,
             },
@@ -101,35 +153,26 @@ class NanoRail:
     def pay_vendor(
         self, vendor: str, amount_cents: int, memo: str, job_id: str | None = None
     ) -> dict[str, Any]:
-        """Outbound feeless payment to a Nano-capable vendor (or simulate it).
+        """Simulated feeless payment to a Nano-capable vendor.
 
         Mirrors StripeClient.pay_vendor's return contract so `stages.py` books
-        the expense unchanged. In simulate mode, builds the spendable payload
-        a buyer would sign and returns a deterministic single-block send id —
-        matching how the rest of the demo reports simulated spend.
+        the expense unchanged. Always `simulated: True`. In live mode (a wallet
+        is configured) it raises NotImplementedError: no block is signed, sent
+        or confirmed here, so nothing may be reported as a real payment.
         """
-        if not isinstance(amount_cents, int) or amount_cents < 0:
+        if not _is_int(amount_cents) or amount_cents < 0:
             raise ValueError("amount_cents must be a non-negative int")
+        if self.live:
+            raise NotImplementedError(
+                "live Nano payments are not implemented; unset NANO_WALLET_ADDRESS "
+                "to simulate, or SOLVENT_NANO_RAIL to spend through Stripe"
+            )
         quote = self.quote_endpoint(vendor, amount_cents)
-        hash_input = f"{self.wallet_address or 'solvent-demo'}:{vendor}:{amount_cents}:{memo}".encode()
-        # Deterministic content-addressed id in simulate mode (no network write)
+        hash_input = f"solvent-demo:{vendor}:{amount_cents}:{memo}".encode()
+        # Deterministic content-addressed id for the simulated block (no network write)
         block_id = hashlib.sha256(hash_input).hexdigest()[:32]
-        if self.live and self.supported():
-            return {
-                "id": block_id,
-                "vendor": vendor,
-                "amount_cents": amount_cents,
-                "memo": memo,
-                "simulated": False,
-                "rail": "nano",
-                "network": NANO_NETWORK,
-                "block": block_id,
-                "job_id": job_id,
-                "ts": time.time(),
-            }
-        ref = "xno_sim_" + uuid.uuid4().hex[:12]
         return {
-            "id": ref,
+            "id": "xno_sim_" + uuid.uuid4().hex[:12],
             "vendor": vendor,
             "amount_cents": amount_cents,
             "memo": memo,

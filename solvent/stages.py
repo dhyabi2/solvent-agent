@@ -12,6 +12,7 @@ from typing import Any
 from . import delivery, service, tools
 from .guardrails import GuardrailError, Guardrails
 from .intake import decline_reason, screen_job
+from .nano_rail import spend_rail
 from .observability import log_event
 from .pricing import PricingPolicy, quote
 from .security import SOLVENTSecurityError, sanitise_job
@@ -135,6 +136,8 @@ class StageRunner:
         self.t = treasury
         self.guard = guard
         self.stripe = stripe
+        # Vendor spend goes through Stripe unless SOLVENT_NANO_RAIL opts in.
+        self.spend_rail = spend_rail(stripe)
         self.pricing = pricing or PricingPolicy()
         self.on_event = on_event
         self.sync_payment = sync_payment
@@ -533,7 +536,7 @@ class StageRunner:
                         raise GuardrailError(
                             f"spend to {vendor} of {amount}c rejected by guardrails: {decision.reason}"
                         )
-                    pay = self.stripe.pay_vendor(vendor, amount, memo, job_id=job_id)
+                    pay = self.spend_rail.pay_vendor(vendor, amount, memo, job_id=job_id)
                     self.t.spend(amount, memo, job_id=job_id, vendor=vendor, stripe_ref=pay["id"])
                     self.t.complete_stage(
                         job_id, "spend", spend_key, {"vendor": vendor, "amount": amount}
